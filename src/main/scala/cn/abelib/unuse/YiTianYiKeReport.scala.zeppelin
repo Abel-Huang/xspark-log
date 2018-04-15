@@ -1,0 +1,389 @@
+/**
+  * Created by Simon on 22/01/2017.
+  */
+
+
+import org.apache.spark.sql.SQLContext
+import org.apache.spark.{SparkConf, SparkContext}
+
+val sc = new SparkContext(new SparkConf().setAppName("Simple Application").setMaster("local[4]"))
+val sqlContext = SQLContext.getOrCreate(sc)
+
+
+def getKey = (System.getenv("yitianyikeAk"), System.getenv("yitainyikeSk"))
+
+val ak = getKey._1
+val sk = getKey._2
+
+// 获得渠道、机型临时表
+// 表： device :  Device(channel: String, model: String)
+// 全局量： globalChannel: Array[String]， 渠道列表
+
+
+case class Device(channel: String, model: String)
+
+val globalChannel = Array("全部", "ASUS", "COOLPAD", "GIONEE", "HISENSE", "HTC", "LENOVO", "NUBIA", "OPPO", "OTHER", "QIKU", "VIVO")
+
+val bucket = "qiniu://fusionlog"
+val devices = s"${bucket}/yitianyike-devices-channel.csv"
+val path = "http://fusionlog.qiniu.com"
+
+sc.hadoopConfiguration.set("spark.sql.parquet.output.committer.class", "org.apache.spark.sql.parquet.DirectParquetOutputCommitter")
+sc.hadoopConfiguration.set("fs.qiniu.access.key", ak)
+sc.hadoopConfiguration.set("fs.qiniu.secret.key", sk)
+sc.hadoopConfiguration.set("fs.qiniu.bucket.domain", path)
+
+val channelrdd = sc.textFile(devices).map(x => {
+  val s = x.split(",");
+  Device(s(1), s(0))
+})
+
+sqlContext.createDataFrame(channelrdd).registerTempTable("device")
+
+sqlContext.sql("select count(1) from device").collect().foreach(println)
+
+try {
+  // 全局量
+  val globalChannel = "全部" +:  sqlContext.sql("select distinct channel from device order by channel ").collect().flatMap(r => Seq(r.getString(0)))
+} catch {
+  case e: Exception => e.printStackTrace()
+}
+
+
+
+
+
+// 获取国家、省份、地区数据，存为临时表
+// 表： region, china  :   Region(nation: String, province: String, city: String)
+
+case class Region(nation: String, province: String, city: String)
+
+// 全局量
+val globalChinaProvince = Array("中国", "上海", "云南", "内蒙古", "北京", "台湾", "吉林", "四川", "天津", "宁夏", "安徽", "山东", "山西", "广东", "广西", "新疆", "江苏", "江西", "河北", "河南", "浙江", "海南", "湖北", "湖南", "澳门", "甘肃", "福建", "西藏", "贵州", "辽宁", "重庆", "陕西", "青海", "香港", "黑龙江")
+
+// 注册国家、省、市表
+def regionTable76(sql:String, table:String): Unit = {
+  val reginrdd = sqlContext.sql(sql).map(r => {
+    val nation = try{r.getString(0)}catch{case e: Exception => ""}
+    val province = try{r.getString(1)}catch{case e: Exception => ""}
+    val city = try{r.getString(2)}catch{case e: Exception => ""}
+    Region(nation, province, city)
+  })
+  sqlContext.createDataFrame(reginrdd).registerTempTable(table)
+}
+
+// 约 650 行
+regionTable76(" select distinct nation, province, city from ytyk ", "region")
+// 约 450 行
+regionTable76(" select nation, province, city from region where nation = '中国' ", "china")
+
+try {
+  val globalChinaProvince =  "中国" +: sqlContext.sql("select distinct province from china order by province ").collect().
+    flatMap(r => Seq(r.getString(0))).filterNot("中国".equalsIgnoreCase(_))
+} catch {
+  case e: Exception => e.printStackTrace()
+}
+
+
+
+
+
+
+// 用户-全国、所有渠道用户省份分布
+%sql select province, count(DISTINCT user) as number from ytyk where nation = '中国' group by province order by number desc
+
+
+
+
+
+
+// 用户-根据省份、渠道查询用户地区分布
+%spark
+
+val select_province = z.select("province", "中国", globalChinaProvince.map(p => (p, p)).toSeq)
+z.show(select_province)
+
+val select_channel = z.select("channel", "全部", globalChannel.map(p => (p, p)).toSeq)
+z.show(select_channel)
+
+val select_province_value = s"${select_province}"
+val select_channel_value = s"${select_channel}"
+
+var regionType = " city "
+var where = " where "
+if ("中国".equalsIgnoreCase(select_province_value) || select_province_value == null || select_province_value.trim.length == 0 ) {
+  where += " nation = '中国' "
+  regionType = " province "
+} else {
+  where += " province = '" + select_province_value + "'"
+}
+
+if (!"全部".equalsIgnoreCase(select_channel_value)  && select_channel_value != null && select_channel_value.trim.length != 0 ) {
+  where += " and  channel = '" +  select_channel_value + "' "
+}
+
+val sql = s"  select ${regionType} as region, floor(count(DISTINCT user)) as Count from ytyk ${where} group by ${regionType} order by Count desc "
+
+z.show(sqlContext.sql(sql))
+
+
+
+
+
+
+
+// 用户-全国渠道用户分布
+%sql
+  select  channel  as channelType, count(DISTINCT user) as number from ytyk  where  nation = '中国'  group by  channel  order by number desc
+
+
+
+
+
+// 用户-根据渠道、省份查询用户机型分布
+
+val select_province = z.select("province", "中国", globalChinaProvince.map(p => (p, p)).toSeq)
+z.show(select_province)
+
+val select_channel = z.select("channel", "全部", globalChannel.map(p => (p, p)).toSeq)
+z.show(select_channel)
+
+val select_province_value = s"${select_province}"
+val select_channel_value = s"${select_channel}"
+
+var channelType = " channel "
+var where = " where "
+if ("中国".equalsIgnoreCase(select_province_value) ||  select_province_value == null || select_province_value.trim.length == 0 ) {
+  where += " nation = '中国' "
+} else {
+  where += " province = '" + select_province_value + "'"
+}
+
+if (!"全部".equalsIgnoreCase(select_channel_value) && select_channel_value != null && select_channel_value.trim.length != 0 ) {
+  where += " and  channel = '" +  select_channel_value + "' "
+  channelType = " model "
+}
+
+val sql = s"  select ${channelType} as channelType, count(DISTINCT user) as number from ytyk ${where} group by ${channelType} order by number desc "
+
+
+z.show(sqlContext.sql(sql))
+
+
+
+
+
+
+// 用户-全国渠道系统分布
+%sql
+  select system , count(DISTINCT user) as number from ytyk  where  nation = '中国'  group by system  order by number desc
+
+
+
+
+
+
+
+// 用户-根据渠道、区域查询用户系统分布
+
+val select_province = z.select("province", "中国", globalChinaProvince.map(p => (p, p)).toSeq)
+z.show(select_province)
+
+val select_channel = z.select("channel", "全部", globalChannel.map(p => (p, p)).toSeq)
+z.show(select_channel)
+
+val select_province_value = s"${select_province}"
+val select_channel_value = s"${select_channel}"
+
+var where = " where "
+if ("中国".equalsIgnoreCase(select_province_value) ||  select_province_value == null || select_province_value.trim.length == 0 ) {
+  where += " nation = '中国' "
+} else {
+  where += " province = '" + select_province_value + "'"
+}
+
+
+if ((!"全部".equalsIgnoreCase(select_channel_value))  && select_channel_value != null && select_channel_value.trim.length != 0 ) {
+  where += " and  channel = '" +  select_channel_value + "' "
+}
+
+val sql = s"  select system , count(DISTINCT user) as number from ytyk ${where} group by system  order by number desc "
+
+z.show(sqlContext.sql(sql))
+
+
+
+
+
+
+
+// 用户-全国带宽
+
+case class Bandwidth(time: Long, channel: String, bandwidth: Long)
+// 带宽： 5 分钟流量 / 300 * 8 bps
+val bandwidthsql = "  select floor(time/300)*300 as 5min, channel,  floor(sum(size)/300*8) as bandwidth  from  ytyk  group by channel, floor(time/300)*300 order by 5min, channel "
+sqlContext.createDataFrame(sqlContext.sql(bandwidthsql).map(r => Bandwidth(r.getLong(0), r.getString(1), r.getLong(2)))).registerTempTable("bandwidth_5min")
+
+// 20 分钟带宽， 取 5 分钟的最大值
+val sql = s"  select   from_unixtime(floor(time/1200)*1200, 'dd HH:mm') as 20min, channel , max(bandwidth) as bandwidth from bandwidth_5min group by channel,  floor(time/1200)*1200 order by 20min "
+z.show(sqlContext.sql(sql))
+
+
+// 厂商-渠道带宽
+val select_channel = z.select("channel", "全部", globalChannel.map(p => (p, p)).toSeq)
+z.show(select_channel)
+
+
+val select_channel_value = s"${select_channel}"
+
+var where = "  "
+if ((!"全部".equalsIgnoreCase(select_channel_value))  && select_channel_value != null && select_channel_value.trim.length != 0 ) {
+  where += " where channel = '" +  select_channel_value + "' "
+}
+
+val sql = s"  select from_unixtime(time, 'dd HH:mm') as 5min, sum(bandwidth) as bandwidth  from bandwidth_5min ${where} group by time order by time "
+
+z.show(sqlContext.sql(sql))
+
+
+// 厂商-5 分钟粒度渠道流量
+
+val select_channel = z.select("channel", "全部", globalChannel.map(p => (p, p)).toSeq)
+z.show(select_channel)
+
+val select_channel_value = s"${select_channel}"
+
+var where = " where 1 = 1 "
+var groupChannel = " channel, "
+
+if ((!"全部".equalsIgnoreCase(select_channel_value))  && select_channel_value != null && select_channel_value.trim.length != 0 ) {
+  where += " and  channel = '" +  select_channel_value + "' "
+  groupChannel = "1"
+}
+// hour:minute ---- G
+val sql = s" select ${groupChannel} as channel from_unixtime(floor(time/300)*300, 'dd HH:mm') as 5min, sum(size) as flux  from  ytyk ${where} group by ${groupChannel} floor(time/300)*300 order by 5min, flux desc  "
+
+z.show(sqlContext.sql(sql))
+
+
+
+
+// 厂商-5 分钟粒度渠道下载图片数
+val select_channel = z.select("channel", "全部", globalChannel.map(p => (p, p)).toSeq)
+z.show(select_channel)
+
+val select_channel_value = s"${select_channel}"
+
+var where = " where code in (200, 206, 304) "
+var groupChannel = " channel, "
+
+if ((!"全部".equalsIgnoreCase(select_channel_value))  && select_channel_value != null && select_channel_value.trim.length != 0 ) {
+  where += " and  channel = '" +  select_channel_value + "' "
+  groupChannel = ""
+}
+
+val sql = s" select ${groupChannel} from_unixtime(floor(time/300)*300, 'dd HH:mm') as 5min,  count(key)/1000 as Count  from  ytyk ${where} group by ${groupChannel} floor(time/300)*300 order by 5min, Count desc  "
+
+z.show(sqlContext.sql(sql))
+
+
+
+// 厂商- 5 分钟粒度活跃用户数
+val select_channel = z.select("channel", "全部", globalChannel.map(p => (p, p)).toSeq)
+z.show(select_channel)
+
+val select_channel_value = s"${select_channel}"
+
+var where = " where 1 = 1 "
+var groupChannel = " channel, "
+
+if ((!"全部".equalsIgnoreCase(select_channel_value))  && select_channel_value != null && select_channel_value.trim.length != 0 ) {
+  where += " and  channel = '" +  select_channel_value + "' "
+  groupChannel = ""
+}
+
+val sql = s" select ${groupChannel} from_unixtime(floor(time/300)*300, 'dd HH:mm') as 5min,  count(DISTINCT user) Count  from  ytyk ${where} group by ${groupChannel} floor(time/300)*300 order by 5min, Count desc  "
+
+z.show(sqlContext.sql(sql))
+
+
+
+
+// 图片-5 分钟粒度单张图片下载次数top500
+val select_channel = z.select("channel", "全部", globalChannel.map(p => (p, p)).toSeq)
+z.show(select_channel)
+
+val select_channel_value = s"${select_channel}"
+
+var where = " where code in (200, 206, 304) "
+
+if ((!"全部".equalsIgnoreCase(select_channel_value))  && select_channel_value != null && select_channel_value.trim.length != 0 ) {
+  where += " and  channel = '" +  select_channel_value + "' "
+}
+
+val sql = s" select key as hash, count(key) as Count , from_unixtime(floor(time/300)*300, 'dd HH:mm') as 5min from  ytyk ${where} group by  floor(time/300)*300, key  order by 5min, Count desc limit 5 "
+
+z.show(sqlContext.sql(sql))
+
+
+
+
+
+// 图片-5 分钟粒度单张图片流量top500
+val select_channel = z.select("channel", "全部", globalChannel.map(p => (p, p)).toSeq)
+z.show(select_channel)
+
+val select_channel_value = s"${select_channel}"
+
+var where = " where code in (200, 206, 304) "
+
+if ((!"全部".equalsIgnoreCase(select_channel_value))  && select_channel_value != null && select_channel_value.trim.length != 0 ) {
+  where += " and  channel = '" +  select_channel_value + "' "
+}
+
+val sql = s" select key as hash, sum(size) flux , from_unixtime(floor(time/300)*300, 'dd HH:mm') as 5min from  ytyk ${where} group by  floor(time/300)*300, key order by 5min, flux desc limit 500 "
+
+z.show(sqlContext.sql(sql))
+
+
+
+
+
+// 图片-总图片下载数
+%sql
+
+select from_unixtime(floor(time/3600)*3600, "yyyy-MM-dd HH:mm") as t, channel, count(1) as c from ytyk group by channel, floor(time/3600) order by t
+
+
+
+
+
+// 图片-总图片流量／带宽
+%sql
+
+select from_unixtime(floor(time/300)*300, "yyyy-MM-dd HH:mm") as t, channel, sum(size) as s from ytyk group by channel, floor(time/300) order by t
+
+
+
+
+
+
+
+// 图片-单张图片下载时间
+%sql
+
+select from_unixtime(floor(time/3600)*3600, "yyyy-MM-dd HH:mm") as t, floor(avg(restime)) as rst , channel from ytyk  group by channel, floor(time/3600) order by t
+
+
+
+
+
+
+
+// 图片-下载错误次数
+%sql
+
+select from_unixtime(floor(time/3600)*3600, "yyyy-MM-dd HH:mm") as t, channel, count(1) as cs from ytyk where code != 200 and code != 206 and code != 304  group by channel, floor(time/3600) order by t
+
+
+
